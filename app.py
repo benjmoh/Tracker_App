@@ -103,7 +103,7 @@ def process():
       - Optional: date_for_name (string "YYYY_MM_DD") for the output filename.
     Returns: Excel file as an attachment (application/vnd.openxmlformats-officedocument.spreadsheetml.sheet)
     """
-    date_for_name = request.form.get("date_for_name") or (request.json or {}).get("date_for_name")
+    date_for_name = request.form.get("date_for_name")
 
     # Case 1: files uploaded directly
     if "location_csv" in request.files and "data_csv" in request.files:
@@ -115,6 +115,9 @@ def process():
 
     # Case 2: URLs provided (Zapier can pass Google Drive direct download links or other public URLs)
     payload = request.get_json(silent=True) or {}
+    if not date_for_name:
+        date_for_name = payload.get("date_for_name")
+
     if payload.get("location_url") and payload.get("data_url"):
         # Note: Render blocks outbound to Google Drive preview URLs unless they're direct-download.
         # Prefer supplying direct file content via multipart where possible.
@@ -128,7 +131,9 @@ def process():
         return send_file(buf, as_attachment=True, download_name=fname,
                          mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    return jsonify({"error": "Provide location_csv & data_csv files, or location_url & data_url"}), 400
+    return jsonify({
+        "error": "Provide location_csv & data_csv files, or location_url & data_url in the request body."
+    }), 400
 
 @app.route("/health", methods=["GET"])
 def health():
