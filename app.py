@@ -3,8 +3,6 @@ import os, io, math, datetime
 import pandas as pd
 from datetime import datetime as dt, timedelta
 from flask import Flask, request, send_file, jsonify
-from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
 
 app = Flask(__name__)
 
@@ -45,18 +43,6 @@ def check_moved_in_48hrs(data, threshold=50):
             return "Y"
     return "N"
 
-def add_filters_to_excel(file_like_bytesio):
-    file_like_bytesio.seek(0)
-    wb = load_workbook(file_like_bytesio)
-    ws = wb.active
-    max_col = ws.max_column
-    max_row = ws.max_row
-    ws.auto_filter.ref = f"A1:{get_column_letter(max_col)}{max_row}"
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
-    return out
-
 def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, date_for_name=None):
     # validate required columns
     for col in ['Serial', 'Address', 'Timestamp', 'Lat', 'Lon']:
@@ -79,17 +65,18 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
             lambda row: create_google_maps_link(row['Lat'], row['Lon']), axis=1
         )
 
-    # write to Excel in memory
-    buf = io.BytesIO()
-    main_data.to_excel(buf, index=False)
+    # write to CSV in memory
+    str_buf = io.StringIO()
+    main_data.to_csv(str_buf, index=False)
+    str_buf.seek(0)
+    buf = io.BytesIO(str_buf.getvalue().encode("utf-8"))
     buf.seek(0)
-    buf = add_filters_to_excel(buf)
 
     # name
     if not date_for_name:
         today = datetime.datetime.now()
         date_for_name = f"{today.year}_{today.month:02d}_{today.day:02d}"
-    filename = f"data_{date_for_name}_updated.xlsx"
+    filename = f"data_{date_for_name}_updated.csv"
     return filename, buf
 
 @app.route("/process", methods=["POST"])
@@ -111,7 +98,7 @@ def process():
         main_data = pd.read_csv(request.files["data_csv"])
         fname, buf = process_dataframes(location_data, main_data, date_for_name)
         return send_file(buf, as_attachment=True, download_name=fname,
-                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                         mimetype="text/csv")
 
     # Case 2: URLs provided (Zapier can pass Google Drive direct download links or other public URLs)
     payload = request.get_json(silent=True) or {}
@@ -130,7 +117,7 @@ def process():
         main_data = pd.read_csv(io.BytesIO(dat.content))
         fname, buf = process_dataframes(location_data, main_data, date_for_name)
         return send_file(buf, as_attachment=True, download_name=fname,
-                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                         mimetype="text/csv")
 
     return jsonify({
         "error": "Provide location_csv & data_csv files, or location_url & data_url in the request body."
