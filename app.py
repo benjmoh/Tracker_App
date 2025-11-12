@@ -115,6 +115,7 @@ def process():
 
     # Case 2: URLs provided (Zapier can pass Google Drive direct download links or other public URLs)
     payload = request.get_json(silent=True) or {}
+
     if not date_for_name:
         date_for_name = payload.get("date_for_name")
 
