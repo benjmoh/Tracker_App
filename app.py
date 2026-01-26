@@ -33,16 +33,47 @@ def calculate_duration(data):
 
 def check_moved_in_48hrs(data, threshold=50):
     data['Timestamp'] = pd.to_datetime(data['Timestamp']).dt.tz_localize(None)
+    data = data.sort_values(by='Timestamp')
+    
+    # Convert Lat and Lon to numeric (they might be strings from CSV)
+    data['Lat'] = pd.to_numeric(data['Lat'], errors='coerce')
+    data['Lon'] = pd.to_numeric(data['Lon'], errors='coerce')
+    
     cutoff_time = dt.now() - timedelta(hours=48)
-    recent_data = data[data['Timestamp'] >= cutoff_time].sort_values(by='Timestamp')
-    if len(recent_data) < 2:
-        return "N"
-    for i in range(1, len(recent_data)):
-        lat1, lon1 = recent_data.iloc[i-1][['Lat', 'Lon']]
-        lat2, lon2 = recent_data.iloc[i][['Lat', 'Lon']]
-        dist = haversine(lat1, lon1, lat2, lon2)
-        if dist > threshold:
-            return "Y"
+    recent_data = data[data['Timestamp'] >= cutoff_time]
+    before_cutoff = data[data['Timestamp'] < cutoff_time]
+    
+    # Check movement between consecutive points within the 48hr window
+    if len(recent_data) >= 2:
+        for i in range(1, len(recent_data)):
+            lat1 = recent_data.iloc[i-1]['Lat']
+            lon1 = recent_data.iloc[i-1]['Lon']
+            lat2 = recent_data.iloc[i]['Lat']
+            lon2 = recent_data.iloc[i]['Lon']
+            
+            if pd.isna(lat1) or pd.isna(lon1) or pd.isna(lat2) or pd.isna(lon2):
+                continue
+                
+            dist = haversine(lat1, lon1, lat2, lon2)
+            if dist > threshold:
+                return "Y"
+    
+    # BUG FIX: Check if there was movement FROM before cutoff TO within cutoff
+    # This catches cases where tracker moved at the start of the 48hr window
+    if len(before_cutoff) > 0 and len(recent_data) > 0:
+        last_before = before_cutoff.iloc[-1]
+        first_recent = recent_data.iloc[0]
+        
+        lat1 = last_before['Lat']
+        lon1 = last_before['Lon']
+        lat2 = first_recent['Lat']
+        lon2 = first_recent['Lon']
+        
+        if not (pd.isna(lat1) or pd.isna(lon1) or pd.isna(lat2) or pd.isna(lon2)):
+            dist = haversine(lat1, lon1, lat2, lon2)
+            if dist > threshold:
+                return "Y"
+    
     return "N"
 
 def add_filters_to_excel(file_like_bytesio):
@@ -73,7 +104,7 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
 
     # add outputs
     main_data['Time_At_Location'] = main_data['Serial'].map(lambda x: durations.get(x, "No data"))
-    main_data['Moved in 48hr'] = main_data['Serial'].map(lambda x: moved_flags.get(x, "N"))
+    main_data['Moved > 50m in 48hr'] = main_data['Serial'].map(lambda x: moved_flags.get(x, "N"))
     if 'Lat' in main_data.columns and 'Lon' in main_data.columns:
         main_data['Google Maps Link'] = main_data.apply(
             lambda row: create_google_maps_link(row['Lat'], row['Lon']), axis=1
