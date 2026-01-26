@@ -43,6 +43,21 @@ def check_moved_in_48hrs(data, threshold=50):
     recent_data = data[data['Timestamp'] >= cutoff_time]
     before_cutoff = data[data['Timestamp'] < cutoff_time]
     
+    # PRIMARY CHECK: If Address hasn't changed in last 48hr, it hasn't moved
+    # (GPS drift can cause false positives, but Address is more reliable)
+    if len(recent_data) > 0:
+        recent_addresses = recent_data['Address'].dropna()
+        if len(recent_addresses) > 0:
+            # Check if all recent points have the same address
+            if recent_addresses.nunique() == 1:
+                # All recent points have same address - check if it's been the same longer
+                if len(before_cutoff) > 0:
+                    last_before_address = before_cutoff.iloc[-1]['Address']
+                    if pd.notna(last_before_address) and last_before_address == recent_addresses.iloc[0]:
+                        # Address hasn't changed, so no movement (ignore GPS drift)
+                        return "N"
+    
+    # SECONDARY CHECK: Use GPS if Address changed or Address data is unreliable
     # Check movement between consecutive points within the 48hr window
     if len(recent_data) >= 2:
         for i in range(1, len(recent_data)):
@@ -58,11 +73,15 @@ def check_moved_in_48hrs(data, threshold=50):
             if dist > threshold:
                 return "Y"
     
-    # BUG FIX: Check if there was movement FROM before cutoff TO within cutoff
-    # This catches cases where tracker moved at the start of the 48hr window
+    # Check if there was movement FROM before cutoff TO within cutoff
     if len(before_cutoff) > 0 and len(recent_data) > 0:
         last_before = before_cutoff.iloc[-1]
         first_recent = recent_data.iloc[0]
+        
+        # If addresses are different, it definitely moved
+        if pd.notna(last_before['Address']) and pd.notna(first_recent['Address']):
+            if last_before['Address'] != first_recent['Address']:
+                return "Y"
         
         lat1 = last_before['Lat']
         lon1 = last_before['Lon']
