@@ -139,29 +139,14 @@ def calculate_duration(data):
     formatted_duration = f"{duration.days} days {str(duration).split(' ')[-1]}"
     return formatted_duration
 
-def check_moved_in_24hr_vs_airtable(data, airtable_positions, threshold=300):
+def check_moved_in_24hr_vs_airtable(current_lat, current_lon, serial, airtable_positions, threshold=300):
     """
-    Compare current tracker position to last position stored in Airtable.
+    Compare current tracker position (from data CSV) to last position stored in Airtable.
     Returns "Y" if moved > threshold meters, else "N".
     """
-    if data.empty:
-        return "N"
-    
-    # Get current position (latest point in data)
-    data['Timestamp'] = pd.to_datetime(data['Timestamp']).dt.tz_localize(None)
-    data = data.sort_values(by='Timestamp')
-    data['Lat'] = pd.to_numeric(data['Lat'], errors='coerce')
-    data['Lon'] = pd.to_numeric(data['Lon'], errors='coerce')
-    
-    last_point = data.iloc[-1]
-    current_lat = last_point['Lat']
-    current_lon = last_point['Lon']
-    
     if pd.isna(current_lat) or pd.isna(current_lon):
         return "N"
     
-    # Get serial number
-    serial = last_point.get('Serial')
     if not serial or serial not in airtable_positions:
         return "N"  # No previous position in Airtable
     
@@ -196,29 +181,41 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
             raise ValueError(f"Location CSV missing required column: {col}")
     if 'Serial' not in main_data.columns:
         raise ValueError("Data CSV missing required column: Serial")
+    if 'Lat' not in main_data.columns or 'Lon' not in main_data.columns:
+        raise ValueError("Data CSV missing required columns: Lat and/or Lon")
 
     # Read last positions from Airtable
     airtable_positions = get_last_positions_from_airtable()
     
+    # Calculate durations from location_data (still needs history for Time_At_Location)
     durations = {}
+    for serial, group in location_data.groupby('Serial'):
+        durations[serial] = calculate_duration(group.copy())
+    
+    # Compare positions from main_data (data CSV) to Airtable
     moved_flags = {}
     current_positions = {}  # Track current positions for Airtable update
     
-    for serial, group in location_data.groupby('Serial'):
-        durations[serial] = calculate_duration(group.copy())
-        moved_flags[serial] = check_moved_in_24hr_vs_airtable(group.copy(), airtable_positions)
+    # Process each row in main_data (the data CSV with final positions)
+    for idx, row in main_data.iterrows():
+        serial = row.get('Serial')
+        if not serial:
+            continue
+            
+        # Get current position from main_data (the data CSV - last known location)
+        current_lat = pd.to_numeric(row.get('Lat'), errors='coerce')
+        current_lon = pd.to_numeric(row.get('Lon'), errors='coerce')
         
-        # Store current position for Airtable update
-        group_sorted = group.copy()
-        group_sorted['Timestamp'] = pd.to_datetime(group_sorted['Timestamp']).dt.tz_localize(None)
-        group_sorted = group_sorted.sort_values(by='Timestamp')
-        group_sorted['Lat'] = pd.to_numeric(group_sorted['Lat'], errors='coerce')
-        group_sorted['Lon'] = pd.to_numeric(group_sorted['Lon'], errors='coerce')
-        last_point = group_sorted.iloc[-1]
-        if not pd.isna(last_point['Lat']) and not pd.isna(last_point['Lon']):
+        # Compare to Airtable position
+        moved_flags[serial] = check_moved_in_24hr_vs_airtable(
+            current_lat, current_lon, serial, airtable_positions
+        )
+        
+        # Store current position for Airtable update (from main_data)
+        if not pd.isna(current_lat) and not pd.isna(current_lon):
             current_positions[serial] = {
-                'lat': float(last_point['Lat']),
-                'lon': float(last_point['Lon'])
+                'lat': float(current_lat),
+                'lon': float(current_lon)
             }
 
     # add outputs
@@ -235,7 +232,7 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
     buf.seek(0)
     buf = add_filters_to_excel(buf)
 
-    # Update Airtable with current positions
+    # Update Airtable with current positions from main_data (data CSV)
     update_airtable_positions(current_positions)
 
     # name
