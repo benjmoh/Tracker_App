@@ -1,10 +1,11 @@
 # app.py
-import os, io, math, datetime
+import os, io, math, datetime, time
 import pandas as pd
 from datetime import datetime as dt, timedelta
 from flask import Flask, request, send_file, jsonify
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+from pyairtable import Table
 
 app = Flask(__name__)
 
@@ -21,6 +22,113 @@ def haversine(lat1, lon1, lat2, lon2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
+def get_airtable_table():
+    """Get Airtable table instance using environment variables."""
+    api_key = os.environ.get("AIRTABLE_API_KEY")
+    base_id = os.environ.get("AIRTABLE_BASE_ID")
+    table_name = os.environ.get("AIRTABLE_TABLE_NAME", "Last Locations")
+    
+    if not api_key or not base_id:
+        return None  # Airtable not configured, will fall back to old logic
+    
+    return Table(api_key, base_id, table_name)
+
+def get_last_positions_from_airtable():
+    """Read last reported positions from Airtable. Returns dict: {serial: {'lat': float, 'lon': float}}"""
+    table = get_airtable_table()
+    if not table:
+        return {}
+    
+    try:
+        records = table.all()
+        positions = {}
+        for record in records:
+            fields = record.get('fields', {})
+            serial = fields.get('Serial')
+            if serial:
+                positions[serial] = {
+                    'lat': fields.get('Last_Report_Lat'),
+                    'lon': fields.get('Last_Report_Lon')
+                }
+        return positions
+    except Exception as e:
+        print(f"Error reading from Airtable: {e}")
+        return {}
+
+def update_airtable_positions(current_positions):
+    """Update Airtable with current positions. Handles rate limiting for 133+ trackers."""
+    table = get_airtable_table()
+    if not table:
+        return
+    
+    try:
+        # Get all existing records to find record IDs (1 request)
+        all_records = table.all()
+        record_map = {}  # {serial: record_id}
+        for record in all_records:
+            serial = record.get('fields', {}).get('Serial')
+            if serial:
+                record_map[serial] = record['id']
+        
+        # Separate updates and creates
+        updates_to_do = []
+        creates_to_do = []
+        
+        for serial, pos in current_positions.items():
+            fields = {
+                'Serial': serial,
+                'Last_Report_Lat': pos['lat'],
+                'Last_Report_Lon': pos['lon']
+            }
+            
+            if serial in record_map:
+                updates_to_do.append((record_map[serial], fields))
+            else:
+                creates_to_do.append(fields)
+        
+        # Process updates with rate limiting (max 4 requests/sec to stay under 5/sec limit)
+        for idx, (record_id, fields) in enumerate(updates_to_do):
+            try:
+                table.update(record_id, fields)
+                # Wait 0.25 seconds between requests (4 requests/sec = safe margin)
+                if idx < len(updates_to_do) - 1:  # Don't wait after last update
+                    time.sleep(0.25)
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "Rate limit" in error_str or "429" in str(getattr(e, 'status_code', '')):
+                    print(f"Rate limit hit during update, waiting 30 seconds...")
+                    time.sleep(30)
+                    # Retry once
+                    try:
+                        table.update(record_id, fields)
+                    except Exception as retry_e:
+                        print(f"Error retrying update for record {record_id}: {retry_e}")
+                else:
+                    print(f"Error updating record {record_id}: {e}")
+        
+        # Process creates with rate limiting
+        for idx, fields in enumerate(creates_to_do):
+            try:
+                table.create(fields)
+                # Wait 0.25 seconds between requests
+                if idx < len(creates_to_do) - 1:  # Don't wait after last create
+                    time.sleep(0.25)
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "Rate limit" in error_str or "429" in str(getattr(e, 'status_code', '')):
+                    print(f"Rate limit hit during create, waiting 30 seconds...")
+                    time.sleep(30)
+                    # Retry once
+                    try:
+                        table.create(fields)
+                    except Exception as retry_e:
+                        print(f"Error retrying create: {retry_e}")
+                else:
+                    print(f"Error creating record: {e}")
+                    
+    except Exception as e:
+        print(f"Error updating Airtable: {e}")
+
 def calculate_duration(data):
     data['Timestamp'] = pd.to_datetime(data['Timestamp']).dt.tz_localize(None)
     data.sort_values(by='Timestamp', inplace=True)
@@ -31,69 +139,43 @@ def calculate_duration(data):
     formatted_duration = f"{duration.days} days {str(duration).split(' ')[-1]}"
     return formatted_duration
 
-def check_moved_in_48hrs(data, threshold=50):
+def check_moved_in_24hr_vs_airtable(data, airtable_positions, threshold=300):
+    """
+    Compare current tracker position to last position stored in Airtable.
+    Returns "Y" if moved > threshold meters, else "N".
+    """
+    if data.empty:
+        return "N"
+    
+    # Get current position (latest point in data)
     data['Timestamp'] = pd.to_datetime(data['Timestamp']).dt.tz_localize(None)
     data = data.sort_values(by='Timestamp')
-    
-    # Convert Lat and Lon to numeric (they might be strings from CSV)
     data['Lat'] = pd.to_numeric(data['Lat'], errors='coerce')
     data['Lon'] = pd.to_numeric(data['Lon'], errors='coerce')
     
-    cutoff_time = dt.now() - timedelta(hours=48)
-    recent_data = data[data['Timestamp'] >= cutoff_time]
-    before_cutoff = data[data['Timestamp'] < cutoff_time]
+    last_point = data.iloc[-1]
+    current_lat = last_point['Lat']
+    current_lon = last_point['Lon']
     
-    # PRIMARY CHECK: If Address hasn't changed in last 48hr, it hasn't moved
-    # (GPS drift can cause false positives, but Address is more reliable)
-    if len(recent_data) > 0:
-        recent_addresses = recent_data['Address'].dropna()
-        if len(recent_addresses) > 0:
-            # Check if all recent points have the same address
-            if recent_addresses.nunique() == 1:
-                # All recent points have same address - check if it's been the same longer
-                if len(before_cutoff) > 0:
-                    last_before_address = before_cutoff.iloc[-1]['Address']
-                    if pd.notna(last_before_address) and last_before_address == recent_addresses.iloc[0]:
-                        # Address hasn't changed, so no movement (ignore GPS drift)
-                        return "N"
+    if pd.isna(current_lat) or pd.isna(current_lon):
+        return "N"
     
-    # SECONDARY CHECK: Use GPS if Address changed or Address data is unreliable
-    # Check movement between consecutive points within the 48hr window
-    if len(recent_data) >= 2:
-        for i in range(1, len(recent_data)):
-            lat1 = recent_data.iloc[i-1]['Lat']
-            lon1 = recent_data.iloc[i-1]['Lon']
-            lat2 = recent_data.iloc[i]['Lat']
-            lon2 = recent_data.iloc[i]['Lon']
-            
-            if pd.isna(lat1) or pd.isna(lon1) or pd.isna(lat2) or pd.isna(lon2):
-                continue
-                
-            dist = haversine(lat1, lon1, lat2, lon2)
-            if dist > threshold:
-                return "Y"
+    # Get serial number
+    serial = last_point.get('Serial')
+    if not serial or serial not in airtable_positions:
+        return "N"  # No previous position in Airtable
     
-    # Check if there was movement FROM before cutoff TO within cutoff
-    if len(before_cutoff) > 0 and len(recent_data) > 0:
-        last_before = before_cutoff.iloc[-1]
-        first_recent = recent_data.iloc[0]
-        
-        # If addresses are different, it definitely moved
-        if pd.notna(last_before['Address']) and pd.notna(first_recent['Address']):
-            if last_before['Address'] != first_recent['Address']:
-                return "Y"
-        
-        lat1 = last_before['Lat']
-        lon1 = last_before['Lon']
-        lat2 = first_recent['Lat']
-        lon2 = first_recent['Lon']
-        
-        if not (pd.isna(lat1) or pd.isna(lon1) or pd.isna(lat2) or pd.isna(lon2)):
-            dist = haversine(lat1, lon1, lat2, lon2)
-            if dist > threshold:
-                return "Y"
+    # Get last reported position from Airtable
+    last_pos = airtable_positions[serial]
+    last_lat = last_pos.get('lat')
+    last_lon = last_pos.get('lon')
     
-    return "N"
+    if pd.isna(last_lat) or pd.isna(last_lon) or last_lat is None or last_lon is None:
+        return "N"
+    
+    # Calculate distance
+    dist = haversine(last_lat, last_lon, current_lat, current_lon)
+    return "Y" if dist > threshold else "N"
 
 def add_filters_to_excel(file_like_bytesio):
     file_like_bytesio.seek(0)
@@ -115,15 +197,33 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
     if 'Serial' not in main_data.columns:
         raise ValueError("Data CSV missing required column: Serial")
 
+    # Read last positions from Airtable
+    airtable_positions = get_last_positions_from_airtable()
+    
     durations = {}
     moved_flags = {}
+    current_positions = {}  # Track current positions for Airtable update
+    
     for serial, group in location_data.groupby('Serial'):
         durations[serial] = calculate_duration(group.copy())
-        moved_flags[serial] = check_moved_in_48hrs(group.copy())
+        moved_flags[serial] = check_moved_in_24hr_vs_airtable(group.copy(), airtable_positions)
+        
+        # Store current position for Airtable update
+        group_sorted = group.copy()
+        group_sorted['Timestamp'] = pd.to_datetime(group_sorted['Timestamp']).dt.tz_localize(None)
+        group_sorted = group_sorted.sort_values(by='Timestamp')
+        group_sorted['Lat'] = pd.to_numeric(group_sorted['Lat'], errors='coerce')
+        group_sorted['Lon'] = pd.to_numeric(group_sorted['Lon'], errors='coerce')
+        last_point = group_sorted.iloc[-1]
+        if not pd.isna(last_point['Lat']) and not pd.isna(last_point['Lon']):
+            current_positions[serial] = {
+                'lat': float(last_point['Lat']),
+                'lon': float(last_point['Lon'])
+            }
 
     # add outputs
     main_data['Time_At_Location'] = main_data['Serial'].map(lambda x: durations.get(x, "No data"))
-    main_data['Moved > 50m in 48hr'] = main_data['Serial'].map(lambda x: moved_flags.get(x, "N"))
+    main_data['Moved in 24hr'] = main_data['Serial'].map(lambda x: moved_flags.get(x, "N"))
     if 'Lat' in main_data.columns and 'Lon' in main_data.columns:
         main_data['Google Maps Link'] = main_data.apply(
             lambda row: create_google_maps_link(row['Lat'], row['Lon']), axis=1
@@ -134,6 +234,9 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
     main_data.to_excel(buf, index=False)
     buf.seek(0)
     buf = add_filters_to_excel(buf)
+
+    # Update Airtable with current positions
+    update_airtable_positions(current_positions)
 
     # name
     if not date_for_name:
