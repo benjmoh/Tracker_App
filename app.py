@@ -158,6 +158,15 @@ def check_moved_in_24hr_vs_airtable(current_lat, current_lon, serial, airtable_p
     if pd.isna(last_lat) or pd.isna(last_lon) or last_lat is None or last_lon is None:
         return "N"
     
+    # Convert to float (Airtable values might be strings)
+    try:
+        last_lat = float(last_lat)
+        last_lon = float(last_lon)
+        current_lat = float(current_lat)
+        current_lon = float(current_lon)
+    except (ValueError, TypeError):
+        return "N"  # Invalid numeric values
+    
     # Calculate distance
     dist = haversine(last_lat, last_lon, current_lat, current_lon)
     return "Y" if dist > threshold else "N"
