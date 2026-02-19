@@ -86,13 +86,13 @@ def update_airtable_positions(current_positions):
             else:
                 creates_to_do.append(fields)
         
-        # Process updates with rate limiting (max 4 requests/sec to stay under 5/sec limit)
+        # Process updates with rate limiting (max ~5 requests/sec to stay under 5/sec limit)
         for idx, (record_id, fields) in enumerate(updates_to_do):
             try:
                 table.update(record_id, fields)
-                # Wait 0.25 seconds between requests (4 requests/sec = safe margin)
+                # Wait 0.2 seconds between requests (~5 requests/sec = safe margin)
                 if idx < len(updates_to_do) - 1:  # Don't wait after last update
-                    time.sleep(0.25)
+                    time.sleep(0.2)
             except Exception as e:
                 error_str = str(e)
                 if "429" in error_str or "Rate limit" in error_str or "429" in str(getattr(e, 'status_code', '')):
@@ -110,9 +110,9 @@ def update_airtable_positions(current_positions):
         for idx, fields in enumerate(creates_to_do):
             try:
                 table.create(fields)
-                # Wait 0.25 seconds between requests
+                # Wait 0.2 seconds between requests
                 if idx < len(creates_to_do) - 1:  # Don't wait after last create
-                    time.sleep(0.25)
+                    time.sleep(0.2)
             except Exception as e:
                 error_str = str(e)
                 if "429" in error_str or "Rate limit" in error_str or "429" in str(getattr(e, 'status_code', '')):
