@@ -1,5 +1,5 @@
 # app.py
-import os, io, math, datetime, time
+import os, io, math, datetime, time, threading
 import pandas as pd
 from datetime import datetime as dt, timedelta
 from flask import Flask, request, send_file, jsonify
@@ -193,8 +193,12 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
     if 'Lat' not in main_data.columns or 'Lon' not in main_data.columns:
         raise ValueError("Data CSV missing required columns: Lat and/or Lon")
 
-    # Read last positions from Airtable
-    airtable_positions = get_last_positions_from_airtable()
+    # Read last positions from Airtable (non-blocking: fall back to {} on error)
+    try:
+        airtable_positions = get_last_positions_from_airtable()
+    except Exception as e:
+        print(f"Error reading from Airtable, continuing without previous positions: {e}")
+        airtable_positions = {}
     
     # Calculate durations from location_data (still needs history for Time_At_Location)
     durations = {}
@@ -241,8 +245,13 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
     buf.seek(0)
     buf = add_filters_to_excel(buf)
 
-    # Update Airtable with current positions from main_data (data CSV)
-    update_airtable_positions(current_positions)
+    # Update Airtable with current positions from main_data (data CSV) - asynchronously in background
+    # This prevents blocking the HTTP response while Airtable updates complete
+    threading.Thread(
+        target=update_airtable_positions,
+        args=(current_positions,),
+        daemon=True
+    ).start()
 
     # name
     if not date_for_name:
