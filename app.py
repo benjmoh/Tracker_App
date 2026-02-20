@@ -63,12 +63,26 @@ def get_last_positions_from_airtable():
         positions = {}
         for record in records:
             fields = record.get('fields', {})
-            serial = fields.get('Serial')
+            serial_raw = fields.get('Serial')
+            serial = str(serial_raw).strip() if serial_raw is not None else None
             if serial:
                 positions[serial] = {
                     'lat': fields.get('Last_Report_Lat'),
                     'lon': fields.get('Last_Report_Lon')
                 }
+        
+        print(f"[Airtable] loaded {len(positions)} records")
+        
+        if positions:
+            k = next(iter(positions))
+            print("[Airtable] sample:", k, positions[k])
+        
+        bad = sum(
+            1 for v in positions.values()
+            if v.get("lat") in (None, "", "NULL") or v.get("lon") in (None, "", "NULL")
+        )
+        print(f"[Airtable] missing lat/lon: {bad}/{len(positions)}")
+        
         return positions
     except Exception as e:
         print(f"Error reading from Airtable: {e}")
@@ -79,9 +93,13 @@ def update_airtable_positions(current_positions):
     Update Airtable with current positions. Runs in background thread.
     Uses batch operations if available, otherwise individual operations with 429 retry.
     """
+    print(f"[Airtable] update requested for {len(current_positions)} trackers")
+    
     table = get_airtable_table()
     if not table:
         return
+    
+    print("[Airtable] table connection OK")
     
     try:
         # Validate and prepare positions
@@ -106,7 +124,8 @@ def update_airtable_positions(current_positions):
         all_records = table.all(fields=["Serial"])
         record_map = {}  # {serial: record_id}
         for record in all_records:
-            serial = record.get('fields', {}).get('Serial')
+            serial_raw = record.get('fields', {}).get('Serial')
+            serial = str(serial_raw).strip() if serial_raw is not None else None
             if serial:
                 record_map[serial] = record['id']
         
@@ -303,6 +322,10 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
         raise ValueError("Data CSV missing required column: Serial")
     if 'Lat' not in main_data.columns or 'Lon' not in main_data.columns:
         raise ValueError("Data CSV missing required columns: Lat and/or Lon")
+    
+    # Normalize serial formatting (strip whitespace, ensure string type)
+    main_data["Serial"] = main_data["Serial"].astype(str).str.strip()
+    location_data["Serial"] = location_data["Serial"].astype(str).str.strip()
 
     # Read last positions from Airtable (non-blocking: fall back to {} on error)
     try:
@@ -310,6 +333,12 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
     except Exception as e:
         print(f"Error reading from Airtable, continuing without previous positions: {e}")
         airtable_positions = {}
+    
+    # Confirm serial overlap
+    air_serials = set(airtable_positions.keys())
+    csv_serials = set(main_data["Serial"].dropna().tolist())
+    overlap = air_serials.intersection(csv_serials)
+    print(f"[Debug] CSV serials: {len(csv_serials)} | Airtable serials: {len(air_serials)} | Overlap: {len(overlap)}")
     
     # Calculate durations from location_data (still needs history for Time_At_Location)
     durations = {}
@@ -371,6 +400,12 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
                 }
             except (ValueError, TypeError):
                 continue
+    
+    print(f"[CSV] current_positions collected: {len(current_positions)}")
+    
+    if len(current_positions) == 0:
+        print("[CSV] sample raw Lat/Lon:",
+              main_data[["Serial","Lat","Lon"]].head(5).to_dict("records"))
 
     # Remove temporary columns used for comparison
     main_data = main_data.drop(columns=['last_lat', 'last_lon'], errors='ignore')
@@ -462,6 +497,15 @@ def process():
 @app.route("/health", methods=["GET"])
 def health():
     return "ok", 200
+
+@app.route("/debug-airtable", methods=["GET"])
+def debug_airtable():
+    positions = get_last_positions_from_airtable()
+    sample = None
+    if positions:
+        k = next(iter(positions))
+        sample = {"serial": k, "pos": positions[k]}
+    return jsonify({"count": len(positions), "sample": sample}), 200
 
 
 if __name__ == "__main__":
