@@ -55,6 +55,31 @@ def get_airtable_table():
     
     return Table(api_key, base_id, table_name)
 
+def utc_today_str():
+    """Return today's UTC date as YYYY-MM-DD string."""
+    return datetime.datetime.utcnow().date().isoformat()
+
+def is_today(value):
+    """
+    Robustly parse Airtable date field to YYYY-MM-DD string and compare to today.
+    Returns True if the date matches today (UTC), else False.
+    """
+    if not value:
+        return False
+    try:
+        # Airtable may return a date string like 'YYYY-MM-DD' or full ISO with time
+        if isinstance(value, str):
+            date_str = value.split("T")[0]
+        else:
+            try:
+                date_str = value.date().isoformat()
+            except AttributeError:
+                return False
+        today_str = utc_today_str()
+        return date_str == today_str
+    except Exception as e:
+        return False
+
 def airtable_already_updated_today(table) -> bool:
     """
     Check if Airtable baseline has already been updated today (UTC) by looking at
@@ -66,40 +91,50 @@ def airtable_already_updated_today(table) -> bool:
             return False
         fields = records[0].get("fields", {})
         last = fields.get("Last_Baseline_Update_Date")
-        if not last:
-            return False
-        # Airtable may return a date string like 'YYYY-MM-DD' or full ISO with time
-        if isinstance(last, str):
-            date_str = last.split("T")[0]
-        else:
-            try:
-                date_str = last.date().isoformat()
-            except AttributeError:
-                return False
-        today_str = datetime.datetime.utcnow().date().isoformat()
-        return date_str == today_str
+        return is_today(last)
     except Exception as e:
         print(f"[Airtable] error checking baseline date: {e}", flush=True)
         return False
 
 def get_last_positions_from_airtable():
-    """Read last reported positions from Airtable. Returns dict: {serial: {'lat': float, 'lon': float}}"""
+    """
+    Read last reported positions from Airtable.
+    Returns dict: {serial: {
+        'last_lat': float, 'last_lon': float,
+        'prev_lat': float, 'prev_lon': float,
+        'baseline_date': str (YYYY-MM-DD)
+    }}
+    """
     table = get_airtable_table()
     if not table:
         return {}
     
     try:
-        # Fetch only required fields to reduce payload size
-        records = table.all(fields=["Serial", "Last_Report_Lat", "Last_Report_Lon"])
+        # Fetch all required fields including prev and baseline date
+        records = table.all(fields=["Serial", "Last_Report_Lat", "Last_Report_Lon", 
+                                    "Prev_Report_Lat", "Prev_Report_Lon", "Last_Baseline_Update_Date"])
         positions = {}
         for record in records:
             fields = record.get('fields', {})
             serial_raw = fields.get('Serial')
             serial = str(serial_raw).strip() if serial_raw is not None else None
             if serial:
+                # Parse baseline_date
+                baseline_date = fields.get('Last_Baseline_Update_Date')
+                if baseline_date and isinstance(baseline_date, str):
+                    baseline_date = baseline_date.split("T")[0]
+                elif baseline_date:
+                    try:
+                        baseline_date = baseline_date.date().isoformat()
+                    except AttributeError:
+                        baseline_date = None
+                
                 positions[serial] = {
-                    'lat': fields.get('Last_Report_Lat'),
-                    'lon': fields.get('Last_Report_Lon')
+                    'last_lat': fields.get('Last_Report_Lat'),
+                    'last_lon': fields.get('Last_Report_Lon'),
+                    'prev_lat': fields.get('Prev_Report_Lat'),
+                    'prev_lon': fields.get('Prev_Report_Lon'),
+                    'baseline_date': baseline_date
                 }
         
         print(f"[Airtable] loaded {len(positions)} records", flush=True)
@@ -110,9 +145,9 @@ def get_last_positions_from_airtable():
         
         bad = sum(
             1 for v in positions.values()
-            if v.get("lat") in (None, "", "NULL") or v.get("lon") in (None, "", "NULL")
+            if v.get("last_lat") in (None, "", "NULL") or v.get("last_lon") in (None, "", "NULL")
         )
-        print(f"[Airtable] missing lat/lon: {bad}/{len(positions)}", flush=True)
+        print(f"[Airtable] missing last lat/lon: {bad}/{len(positions)}", flush=True)
         
         return positions
     except Exception as e:
@@ -138,7 +173,7 @@ def update_airtable_positions(current_positions):
         return
     
     try:
-        today_str = datetime.datetime.utcnow().date().isoformat()
+        today_str = utc_today_str()
         # Validate and prepare positions
         validated_positions = {}
         for serial, pos in current_positions.items():
@@ -157,30 +192,54 @@ def update_airtable_positions(current_positions):
         if not validated_positions:
             return
         
-        # Get all existing records to find record IDs (1 request)
-        all_records = table.all(fields=["Serial"])
+        # Get all existing records to find record IDs and current Last values (for shifting)
+        all_records = table.all(fields=["Serial", "Last_Report_Lat", "Last_Report_Lon"])
         record_map = {}  # {serial: record_id}
+        existing_last = {}  # {serial: {'lat': float, 'lon': float}}
         for record in all_records:
-            serial_raw = record.get('fields', {}).get('Serial')
+            fields = record.get('fields', {})
+            serial_raw = fields.get('Serial')
             serial = str(serial_raw).strip() if serial_raw is not None else None
             if serial:
                 record_map[serial] = record['id']
+                # Store existing Last values for shifting to Prev
+                last_lat = fields.get('Last_Report_Lat')
+                last_lon = fields.get('Last_Report_Lon')
+                if last_lat is not None and last_lon is not None:
+                    try:
+                        existing_last[serial] = {
+                            'lat': float(last_lat),
+                            'lon': float(last_lon)
+                        }
+                    except (ValueError, TypeError):
+                        pass
         
         # Separate updates and creates
         updates_to_do = []
         creates_to_do = []
         
         for serial, pos in validated_positions.items():
-            fields = {
-                'Serial': str(serial),
-                'Last_Report_Lat': pos['lat'],
-                'Last_Report_Lon': pos['lon'],
-                'Last_Baseline_Update_Date': today_str
-            }
-            
             if serial in record_map:
+                # Update existing record: shift Last -> Prev, set new Last
+                fields = {
+                    'Serial': str(serial),
+                    'Last_Report_Lat': pos['lat'],
+                    'Last_Report_Lon': pos['lon'],
+                    'Last_Baseline_Update_Date': today_str
+                }
+                # Shift existing Last to Prev if available
+                if serial in existing_last:
+                    fields['Prev_Report_Lat'] = existing_last[serial]['lat']
+                    fields['Prev_Report_Lon'] = existing_last[serial]['lon']
                 updates_to_do.append((record_map[serial], fields))
             else:
+                # Create new record: only set Last (Prev can be omitted/blank)
+                fields = {
+                    'Serial': str(serial),
+                    'Last_Report_Lat': pos['lat'],
+                    'Last_Report_Lon': pos['lon'],
+                    'Last_Baseline_Update_Date': today_str
+                }
                 creates_to_do.append(fields)
         
         # Try batch operations if available (pyairtable 2.0+)
@@ -309,7 +368,8 @@ def calculate_duration(data):
 
 def check_moved_in_24hr_vs_airtable(current_lat, current_lon, serial, airtable_positions, threshold=300):
     """
-    Compare current tracker position (from data CSV) to last position stored in Airtable.
+    Compare current tracker position (from data CSV) to baseline position stored in Airtable.
+    Uses Prev baseline if already updated today, otherwise uses Last baseline.
     Returns "Y" if moved > threshold meters, else "N".
     """
     if pd.isna(current_lat) or pd.isna(current_lon):
@@ -318,25 +378,36 @@ def check_moved_in_24hr_vs_airtable(current_lat, current_lon, serial, airtable_p
     if not serial or serial not in airtable_positions:
         return "N"  # No previous position in Airtable
     
-    # Get last reported position from Airtable
-    last_pos = airtable_positions[serial]
-    last_lat = last_pos.get('lat')
-    last_lon = last_pos.get('lon')
+    # Get position record from Airtable
+    rec = airtable_positions[serial]
     
-    if pd.isna(last_lat) or pd.isna(last_lon) or last_lat is None or last_lon is None:
+    # Determine baseline: use prev if already updated today, otherwise use last
+    baseline_lat = None
+    baseline_lon = None
+    use_prev = False
+    
+    if is_today(rec.get("baseline_date")) and rec.get("prev_lat") is not None and rec.get("prev_lon") is not None:
+        baseline_lat = rec.get("prev_lat")
+        baseline_lon = rec.get("prev_lon")
+        use_prev = True
+    else:
+        baseline_lat = rec.get("last_lat")
+        baseline_lon = rec.get("last_lon")
+    
+    if pd.isna(baseline_lat) or pd.isna(baseline_lon) or baseline_lat is None or baseline_lon is None:
         return "N"
     
     # Convert to float (Airtable values might be strings)
     try:
-        last_lat = float(last_lat)
-        last_lon = float(last_lon)
+        baseline_lat = float(baseline_lat)
+        baseline_lon = float(baseline_lon)
         current_lat = float(current_lat)
         current_lon = float(current_lon)
     except (ValueError, TypeError):
         return "N"  # Invalid numeric values
     
     # Calculate distance
-    dist = haversine(last_lat, last_lon, current_lat, current_lon)
+    dist = haversine(baseline_lat, baseline_lon, current_lat, current_lon)
     return "Y" if dist > threshold else "N"
 
 def add_filters_to_excel(file_like_bytesio):
@@ -384,18 +455,40 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
         durations[serial] = calculate_duration(group.copy())
     
     # Vectorized comparison: Build DataFrame from Airtable positions and merge
-    # Convert Airtable positions dict to DataFrame for efficient merging
+    # Determine baseline per serial: use prev if already updated today, otherwise use last
     if airtable_positions:
+        today_str = utc_today_str()
         airtable_df = pd.DataFrame([
             {
                 'Serial': serial,
-                'last_lat': pos.get('lat'),
-                'last_lon': pos.get('lon')
+                'baseline_lat': (
+                    pos.get('prev_lat') 
+                    if (is_today(pos.get('baseline_date')) and 
+                        pos.get('prev_lat') is not None and 
+                        pos.get('prev_lon') is not None)
+                    else pos.get('last_lat')
+                ),
+                'baseline_lon': (
+                    pos.get('prev_lon')
+                    if (is_today(pos.get('baseline_date')) and 
+                        pos.get('prev_lat') is not None and 
+                        pos.get('prev_lon') is not None)
+                    else pos.get('last_lon')
+                )
             }
             for serial, pos in airtable_positions.items()
-        ])
+        )
+        # Count how many use prev baseline
+        prev_count = sum(
+            1 for pos in airtable_positions.values()
+            if (is_today(pos.get('baseline_date')) and 
+                pos.get('prev_lat') is not None and 
+                pos.get('prev_lon') is not None)
+        )
+        if prev_count > 0:
+            print(f"[Compare] using prev baseline for {prev_count} duplicates today", flush=True)
     else:
-        airtable_df = pd.DataFrame(columns=['Serial', 'last_lat', 'last_lon'])
+        airtable_df = pd.DataFrame(columns=['Serial', 'baseline_lat', 'baseline_lon'])
     
     # Merge Airtable positions onto main_data
     main_data = main_data.merge(airtable_df, on='Serial', how='left')
@@ -403,14 +496,14 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
     # Convert Lat/Lon to numeric (coerce errors to NaN)
     main_data['Lat'] = pd.to_numeric(main_data['Lat'], errors='coerce')
     main_data['Lon'] = pd.to_numeric(main_data['Lon'], errors='coerce')
-    main_data['last_lat'] = pd.to_numeric(main_data['last_lat'], errors='coerce')
-    main_data['last_lon'] = pd.to_numeric(main_data['last_lon'], errors='coerce')
+    main_data['baseline_lat'] = pd.to_numeric(main_data['baseline_lat'], errors='coerce')
+    main_data['baseline_lon'] = pd.to_numeric(main_data['baseline_lon'], errors='coerce')
     
     # Vectorized distance calculation using numpy
     # Distance is NaN if any lat/lon is missing
     distance = haversine_vectorized(
-        main_data['last_lat'].values,
-        main_data['last_lon'].values,
+        main_data['baseline_lat'].values,
+        main_data['baseline_lon'].values,
         main_data['Lat'].values,
         main_data['Lon'].values
     )
@@ -451,7 +544,7 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
               main_data[["Serial","Lat","Lon"]].head(5).to_dict("records"), flush=True)
 
     # Remove temporary columns used for comparison
-    main_data = main_data.drop(columns=['last_lat', 'last_lon'], errors='ignore')
+    main_data = main_data.drop(columns=['baseline_lat', 'baseline_lon'], errors='ignore')
     
     # add outputs
     main_data['Time_At_Location'] = main_data['Serial'].map(lambda x: durations.get(x, "No data"))
