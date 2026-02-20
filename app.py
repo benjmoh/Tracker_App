@@ -1,6 +1,7 @@
 # app.py
 import os, io, math, datetime, time, threading
 import pandas as pd
+import numpy as np
 from datetime import datetime as dt, timedelta
 from flask import Flask, request, send_file, jsonify
 from openpyxl import load_workbook
@@ -22,6 +23,23 @@ def haversine(lat1, lon1, lat2, lon2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
+def haversine_vectorized(lat1, lon1, lat2, lon2):
+    """
+    Vectorized haversine distance calculation using numpy.
+    Returns distance in meters. Returns NaN where any input is NaN.
+    """
+    R = 6371000
+    # Convert to radians
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+    
+    # Haversine formula
+    a = np.sin(dphi/2)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda/2)**2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    return R * c
+
 def get_airtable_table():
     """Get Airtable table instance using environment variables."""
     api_key = os.environ.get("AIRTABLE_API_KEY")
@@ -40,7 +58,8 @@ def get_last_positions_from_airtable():
         return {}
     
     try:
-        records = table.all()
+        # Fetch only required fields to reduce payload size
+        records = table.all(fields=["Serial", "Last_Report_Lat", "Last_Report_Lon"])
         positions = {}
         for record in records:
             fields = record.get('fields', {})
@@ -56,14 +75,35 @@ def get_last_positions_from_airtable():
         return {}
 
 def update_airtable_positions(current_positions):
-    """Update Airtable with current positions. Handles rate limiting for 133+ trackers."""
+    """
+    Update Airtable with current positions. Runs in background thread.
+    Uses batch operations if available, otherwise individual operations with 429 retry.
+    """
     table = get_airtable_table()
     if not table:
         return
     
     try:
+        # Validate and prepare positions
+        validated_positions = {}
+        for serial, pos in current_positions.items():
+            try:
+                lat = float(pos['lat'])
+                lon = float(pos['lon'])
+                # Validate coordinate ranges
+                if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+                    print(f"Skipping invalid coordinates for {serial}: lat={lat}, lon={lon}")
+                    continue
+                validated_positions[serial] = {'lat': lat, 'lon': lon}
+            except (ValueError, TypeError, KeyError) as e:
+                print(f"Skipping {serial} due to invalid position data: {e}")
+                continue
+        
+        if not validated_positions:
+            return
+        
         # Get all existing records to find record IDs (1 request)
-        all_records = table.all()
+        all_records = table.all(fields=["Serial"])
         record_map = {}  # {serial: record_id}
         for record in all_records:
             serial = record.get('fields', {}).get('Serial')
@@ -74,9 +114,9 @@ def update_airtable_positions(current_positions):
         updates_to_do = []
         creates_to_do = []
         
-        for serial, pos in current_positions.items():
+        for serial, pos in validated_positions.items():
             fields = {
-                'Serial': serial,
+                'Serial': str(serial),
                 'Last_Report_Lat': pos['lat'],
                 'Last_Report_Lon': pos['lon']
             }
@@ -86,45 +126,116 @@ def update_airtable_positions(current_positions):
             else:
                 creates_to_do.append(fields)
         
-        # Process updates with rate limiting (max ~5 requests/sec to stay under 5/sec limit)
-        for idx, (record_id, fields) in enumerate(updates_to_do):
-            try:
-                table.update(record_id, fields)
-                # Wait 0.2 seconds between requests (~5 requests/sec = safe margin)
-                if idx < len(updates_to_do) - 1:  # Don't wait after last update
-                    time.sleep(0.2)
-            except Exception as e:
-                error_str = str(e)
-                if "429" in error_str or "Rate limit" in error_str or "429" in str(getattr(e, 'status_code', '')):
-                    print(f"Rate limit hit during update, waiting 30 seconds...")
-                    time.sleep(30)
-                    # Retry once
+        # Try batch operations if available (pyairtable 2.0+)
+        try:
+            # Check if batch_update method exists
+            if hasattr(table, 'batch_update') and updates_to_do:
+                # Process updates in chunks of 10 (Airtable batch limit)
+                chunk_size = 10
+                for i in range(0, len(updates_to_do), chunk_size):
+                    chunk = updates_to_do[i:i+chunk_size]
+                    batch_data = [{'id': rid, 'fields': fields} for rid, fields in chunk]
+                    try:
+                        table.batch_update(batch_data)
+                    except Exception as e:
+                        error_str = str(e)
+                        if "429" in error_str or "Rate limit" in error_str:
+                            print(f"Rate limit hit during batch update, waiting 30 seconds...")
+                            time.sleep(30)
+                            table.batch_update(batch_data)
+                        else:
+                            print(f"Error in batch update: {e}")
+                            # Fall back to individual updates for this chunk
+                            for record_id, fields in chunk:
+                                try:
+                                    table.update(record_id, fields)
+                                except Exception as update_e:
+                                    print(f"Error updating record {record_id}: {update_e}")
+            else:
+                # Fall back to individual updates
+                for record_id, fields in updates_to_do:
                     try:
                         table.update(record_id, fields)
-                    except Exception as retry_e:
-                        print(f"Error retrying update for record {record_id}: {retry_e}")
-                else:
-                    print(f"Error updating record {record_id}: {e}")
-        
-        # Process creates with rate limiting
-        for idx, fields in enumerate(creates_to_do):
-            try:
-                table.create(fields)
-                # Wait 0.2 seconds between requests
-                if idx < len(creates_to_do) - 1:  # Don't wait after last create
-                    time.sleep(0.2)
-            except Exception as e:
-                error_str = str(e)
-                if "429" in error_str or "Rate limit" in error_str or "429" in str(getattr(e, 'status_code', '')):
-                    print(f"Rate limit hit during create, waiting 30 seconds...")
-                    time.sleep(30)
-                    # Retry once
+                    except Exception as e:
+                        error_str = str(e)
+                        if "429" in error_str or "Rate limit" in error_str:
+                            print(f"Rate limit hit during update, waiting 30 seconds...")
+                            time.sleep(30)
+                            try:
+                                table.update(record_id, fields)
+                            except Exception as retry_e:
+                                print(f"Error retrying update for record {record_id}: {retry_e}")
+                        else:
+                            print(f"Error updating record {record_id}: {e}")
+            
+            # Try batch_create if available
+            if hasattr(table, 'batch_create') and creates_to_do:
+                chunk_size = 10
+                for i in range(0, len(creates_to_do), chunk_size):
+                    chunk = creates_to_do[i:i+chunk_size]
+                    try:
+                        table.batch_create(chunk)
+                    except Exception as e:
+                        error_str = str(e)
+                        if "429" in error_str or "Rate limit" in error_str:
+                            print(f"Rate limit hit during batch create, waiting 30 seconds...")
+                            time.sleep(30)
+                            table.batch_create(chunk)
+                        else:
+                            print(f"Error in batch create: {e}")
+                            # Fall back to individual creates
+                            for fields in chunk:
+                                try:
+                                    table.create(fields)
+                                except Exception as create_e:
+                                    print(f"Error creating record: {create_e}")
+            else:
+                # Fall back to individual creates
+                for fields in creates_to_do:
                     try:
                         table.create(fields)
-                    except Exception as retry_e:
-                        print(f"Error retrying create: {retry_e}")
-                else:
-                    print(f"Error creating record: {e}")
+                    except Exception as e:
+                        error_str = str(e)
+                        if "429" in error_str or "Rate limit" in error_str:
+                            print(f"Rate limit hit during create, waiting 30 seconds...")
+                            time.sleep(30)
+                            try:
+                                table.create(fields)
+                            except Exception as retry_e:
+                                print(f"Error retrying create: {retry_e}")
+                        else:
+                            print(f"Error creating record: {e}")
+        except AttributeError:
+            # pyairtable version doesn't support batch operations, use individual
+            for record_id, fields in updates_to_do:
+                try:
+                    table.update(record_id, fields)
+                except Exception as e:
+                    error_str = str(e)
+                    if "429" in error_str or "Rate limit" in error_str:
+                        print(f"Rate limit hit during update, waiting 30 seconds...")
+                        time.sleep(30)
+                        try:
+                            table.update(record_id, fields)
+                        except Exception as retry_e:
+                            print(f"Error retrying update for record {record_id}: {retry_e}")
+                    else:
+                        print(f"Error updating record {record_id}: {e}")
+            
+            for fields in creates_to_do:
+                try:
+                    table.create(fields)
+                except Exception as e:
+                    error_str = str(e)
+                    if "429" in error_str or "Rate limit" in error_str:
+                        print(f"Rate limit hit during create, waiting 30 seconds...")
+                        time.sleep(30)
+                        try:
+                            table.create(fields)
+                        except Exception as retry_e:
+                            print(f"Error retrying create: {retry_e}")
+                    else:
+                        print(f"Error creating record: {e}")
                     
     except Exception as e:
         print(f"Error updating Airtable: {e}")
@@ -205,35 +316,67 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
     for serial, group in location_data.groupby('Serial'):
         durations[serial] = calculate_duration(group.copy())
     
-    # Compare positions from main_data (data CSV) to Airtable
-    moved_flags = {}
-    current_positions = {}  # Track current positions for Airtable update
+    # Vectorized comparison: Build DataFrame from Airtable positions and merge
+    # Convert Airtable positions dict to DataFrame for efficient merging
+    if airtable_positions:
+        airtable_df = pd.DataFrame([
+            {
+                'Serial': serial,
+                'last_lat': pos.get('lat'),
+                'last_lon': pos.get('lon')
+            }
+            for serial, pos in airtable_positions.items()
+        ])
+    else:
+        airtable_df = pd.DataFrame(columns=['Serial', 'last_lat', 'last_lon'])
     
-    # Process each row in main_data (the data CSV with final positions)
+    # Merge Airtable positions onto main_data
+    main_data = main_data.merge(airtable_df, on='Serial', how='left')
+    
+    # Convert Lat/Lon to numeric (coerce errors to NaN)
+    main_data['Lat'] = pd.to_numeric(main_data['Lat'], errors='coerce')
+    main_data['Lon'] = pd.to_numeric(main_data['Lon'], errors='coerce')
+    main_data['last_lat'] = pd.to_numeric(main_data['last_lat'], errors='coerce')
+    main_data['last_lon'] = pd.to_numeric(main_data['last_lon'], errors='coerce')
+    
+    # Vectorized distance calculation using numpy
+    # Distance is NaN if any lat/lon is missing
+    distance = haversine_vectorized(
+        main_data['last_lat'].values,
+        main_data['last_lon'].values,
+        main_data['Lat'].values,
+        main_data['Lon'].values
+    )
+    
+    # Set moved_flag: "Y" if distance > 300m, else "N" (default "N" for NaN/missing)
+    main_data['Moved in 24hr'] = np.where(
+        (pd.notna(distance)) & (distance > 300),
+        "Y",
+        "N"
+    )
+    
+    # Build current_positions dict for Airtable update (only valid coordinates)
+    current_positions = {}
     for idx, row in main_data.iterrows():
         serial = row.get('Serial')
         if not serial:
             continue
-            
-        # Get current position from main_data (the data CSV - last known location)
-        current_lat = pd.to_numeric(row.get('Lat'), errors='coerce')
-        current_lon = pd.to_numeric(row.get('Lon'), errors='coerce')
-        
-        # Compare to Airtable position
-        moved_flags[serial] = check_moved_in_24hr_vs_airtable(
-            current_lat, current_lon, serial, airtable_positions
-        )
-        
-        # Store current position for Airtable update (from main_data)
-        if not pd.isna(current_lat) and not pd.isna(current_lon):
-            current_positions[serial] = {
-                'lat': float(current_lat),
-                'lon': float(current_lon)
-            }
+        current_lat = row.get('Lat')
+        current_lon = row.get('Lon')
+        if pd.notna(current_lat) and pd.notna(current_lon):
+            try:
+                current_positions[serial] = {
+                    'lat': float(current_lat),
+                    'lon': float(current_lon)
+                }
+            except (ValueError, TypeError):
+                continue
 
+    # Remove temporary columns used for comparison
+    main_data = main_data.drop(columns=['last_lat', 'last_lon'], errors='ignore')
+    
     # add outputs
     main_data['Time_At_Location'] = main_data['Serial'].map(lambda x: durations.get(x, "No data"))
-    main_data['Moved in 24hr'] = main_data['Serial'].map(lambda x: moved_flags.get(x, "N"))
     if 'Lat' in main_data.columns and 'Lon' in main_data.columns:
         main_data['Google Maps Link'] = main_data.apply(
             lambda row: create_google_maps_link(row['Lat'], row['Lon']), axis=1
