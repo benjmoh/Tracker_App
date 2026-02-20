@@ -262,38 +262,50 @@ def process():
       - Optional: date_for_name (string "YYYY_MM_DD") for the output filename.
     Returns: Excel file as an attachment (application/vnd.openxmlformats-officedocument.spreadsheetml.sheet)
     """
-    date_for_name = request.form.get("date_for_name")
+    try:
+        date_for_name = request.form.get("date_for_name")
 
-    # Case 1: files uploaded directly
-    if "location_csv" in request.files and "data_csv" in request.files:
-        location_data = pd.read_csv(request.files["location_csv"])
-        main_data = pd.read_csv(request.files["data_csv"])
-        fname, buf = process_dataframes(location_data, main_data, date_for_name)
-        return send_file(buf, as_attachment=True, download_name=fname,
-                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        # Case 1: files uploaded directly
+        if "location_csv" in request.files and "data_csv" in request.files:
+            location_data = pd.read_csv(request.files["location_csv"])
+            main_data = pd.read_csv(request.files["data_csv"])
+            fname, buf = process_dataframes(location_data, main_data, date_for_name)
+            return send_file(buf, as_attachment=True, download_name=fname,
+                             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    # Case 2: URLs provided (Zapier can pass Google Drive direct download links or other public URLs)
-    payload = request.get_json(silent=True) or {}
+        # Case 2: URLs provided (Zapier can pass Google Drive direct download links or other public URLs)
+        payload = request.get_json(silent=True) or {}
 
-    if not date_for_name:
-        date_for_name = payload.get("date_for_name")
+        if not date_for_name:
+            date_for_name = payload.get("date_for_name")
 
-    if payload.get("location_url") and payload.get("data_url"):
-        # Note: Render blocks outbound to Google Drive preview URLs unless they're direct-download.
-        # Prefer supplying direct file content via multipart where possible.
-        import requests
-        loc = requests.get(payload["location_url"])
-        dat = requests.get(payload["data_url"])
-        loc.raise_for_status(); dat.raise_for_status()
-        location_data = pd.read_csv(io.BytesIO(loc.content))
-        main_data = pd.read_csv(io.BytesIO(dat.content))
-        fname, buf = process_dataframes(location_data, main_data, date_for_name)
-        return send_file(buf, as_attachment=True, download_name=fname,
-                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        if payload.get("location_url") and payload.get("data_url"):
+            # Note: Render blocks outbound to Google Drive preview URLs unless they're direct-download.
+            # Prefer supplying direct file content via multipart where possible.
+            import requests
+            loc = requests.get(payload["location_url"])
+            dat = requests.get(payload["data_url"])
+            loc.raise_for_status(); dat.raise_for_status()
+            location_data = pd.read_csv(io.BytesIO(loc.content))
+            main_data = pd.read_csv(io.BytesIO(dat.content))
+            fname, buf = process_dataframes(location_data, main_data, date_for_name)
+            return send_file(buf, as_attachment=True, download_name=fname,
+                             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    return jsonify({
-        "error": "Provide location_csv & data_csv files, or location_url & data_url in the request body."
-    }), 400
+        return jsonify({
+            "error": "Provide location_csv & data_csv files, or location_url & data_url in the request body."
+        }), 400
+
+    except Exception as e:
+        import traceback
+        import sys
+        error_msg = f"Error in /process: {str(e)}"
+        print(error_msg, file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return jsonify({
+            "error": "Internal server error",
+            "details": str(e)
+        }), 500
 
 @app.route("/health", methods=["GET"])
 def health():
