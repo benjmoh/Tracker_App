@@ -388,6 +388,11 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
         "N"
     )
     
+    # Debug: Count how many trackers moved
+    moved_flags = main_data['Moved in 24hr'].to_dict()
+    y_count = sum(1 for v in moved_flags.values() if v == "Y")
+    print(f"[Compare] moved=Y count: {y_count}/{len(moved_flags)}", flush=True)
+    
     # Build current_positions dict for Airtable update (only valid coordinates)
     current_positions = {}
     for idx, row in main_data.iterrows():
@@ -429,11 +434,16 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
 
     # Update Airtable with current positions from main_data (data CSV) - asynchronously in background
     # This prevents blocking the HTTP response while Airtable updates complete
-    threading.Thread(
-        target=update_airtable_positions,
-        args=(current_positions,),
-        daemon=True
-    ).start()
+    # ONLY AFTER Excel buffer is created
+    def _update_airtable():
+        try:
+            update_airtable_positions(current_positions)
+            print("[Airtable] update finished", flush=True)
+        except Exception as e:
+            print(f"[Airtable] update failed: {e}", flush=True)
+    
+    threading.Thread(target=_update_airtable, daemon=False).start()
+    print("[Airtable] update thread started", flush=True)
 
     # name
     if not date_for_name:
