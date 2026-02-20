@@ -366,6 +366,61 @@ def calculate_duration(data):
     formatted_duration = f"{duration.days} days {str(duration).split(' ')[-1]}"
     return formatted_duration
 
+def calculate_duration_within_threshold(group: pd.DataFrame, threshold_m=300) -> str:
+    """
+    Calculate time at location using GPS distance threshold (300m).
+    Returns time elapsed since tracker last moved MORE than threshold_m from current location.
+    """
+    # Parse Timestamp to naive datetime
+    group = group.copy()
+    group['Timestamp'] = pd.to_datetime(group['Timestamp']).dt.tz_localize(None)
+    
+    # Sort by Timestamp ascending
+    group.sort_values(by='Timestamp', inplace=True)
+    
+    # Convert Lat/Lon to numeric, coercing errors to NaN
+    group['Lat'] = pd.to_numeric(group['Lat'], errors='coerce')
+    group['Lon'] = pd.to_numeric(group['Lon'], errors='coerce')
+    
+    # Drop rows with missing Lat/Lon/Timestamp
+    group = group.dropna(subset=['Lat', 'Lon', 'Timestamp'])
+    
+    # If < 1 valid rows: return "No data"
+    if len(group) < 1:
+        return "No data"
+    
+    # Let current_point be the last valid row (most recent)
+    current_point = group.iloc[-1]
+    current_lat = current_point['Lat']
+    current_lon = current_point['Lon']
+    current_timestamp = current_point['Timestamp']
+    
+    # Walk backwards from the most recent row toward older rows
+    # Find the earliest row from the end where distance to reference point is still <= threshold_m
+    start_timestamp = group.iloc[0]['Timestamp']  # Default: if all points within threshold, use earliest
+    
+    for i in range(len(group) - 2, -1, -1):  # Start from second-to-last, go backwards
+        row = group.iloc[i]
+        row_lat = row['Lat']
+        row_lon = row['Lon']
+        
+        # Calculate distance from current point
+        distance = haversine(current_lat, current_lon, row_lat, row_lon)
+        
+        # As soon as you hit a row with distance > threshold_m, stop
+        if distance > threshold_m:
+            # The start time is the next row after the first >threshold
+            # (i.e., the row at i+1, which is the first row within threshold)
+            start_timestamp = group.iloc[i + 1]['Timestamp']
+            break
+    
+    # Duration = current_timestamp - start_timestamp
+    duration = current_timestamp - start_timestamp
+    
+    # Return as "X days HH:MM:SS" (same style as current function)
+    formatted_duration = f"{duration.days} days {str(duration).split(' ')[-1]}"
+    return formatted_duration
+
 def check_moved_in_24hr_vs_airtable(current_lat, current_lon, serial, airtable_positions, threshold=300):
     """
     Compare current tracker position (from data CSV) to baseline position stored in Airtable.
@@ -449,10 +504,11 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
     overlap = air_serials.intersection(csv_serials)
     print(f"[Debug] CSV serials: {len(csv_serials)} | Airtable serials: {len(air_serials)} | Overlap: {len(overlap)}", flush=True)
     
-    # Calculate durations from location_data (still needs history for Time_At_Location)
+    # Calculate durations from location_data using 300m GPS threshold (same as movement flag)
+    print("[TimeAtLocation] using 300m threshold dwell time", flush=True)
     durations = {}
     for serial, group in location_data.groupby('Serial'):
-        durations[serial] = calculate_duration(group.copy())
+        durations[serial] = calculate_duration_within_threshold(group.copy(), threshold_m=300)
     
     # Vectorized comparison: Build DataFrame from Airtable positions and merge
     # Determine baseline per serial: use prev if already updated today, otherwise use last
