@@ -477,7 +477,7 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
                 )
             }
             for serial, pos in airtable_positions.items()
-        )
+        ])
         # Count how many use prev baseline
         prev_count = sum(
             1 for pos in airtable_positions.values()
