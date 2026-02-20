@@ -509,14 +509,14 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
     )
     
     # Set moved_flag: "Y" if distance > 300m, else "N" (default "N" for NaN/missing)
-    main_data['Moved in 24hr'] = np.where(
+    main_data['Moved since last report'] = np.where(
         (pd.notna(distance)) & (distance > 300),
         "Y",
         "N"
     )
     
     # Debug: Count how many trackers moved
-    moved_flags = main_data['Moved in 24hr'].to_dict()
+    moved_flags = main_data['Moved since last report'].to_dict()
     y_count = sum(1 for v in moved_flags.values() if v == "Y")
     print(f"[Compare] moved=Y count: {y_count}/{len(moved_flags)}", flush=True)
     
