@@ -55,6 +55,33 @@ def get_airtable_table():
     
     return Table(api_key, base_id, table_name)
 
+def airtable_already_updated_today(table) -> bool:
+    """
+    Check if Airtable baseline has already been updated today (UTC) by looking at
+    the Last_Baseline_Update_Date field on any record.
+    """
+    try:
+        records = table.all(max_records=1, fields=["Last_Baseline_Update_Date"])
+        if not records:
+            return False
+        fields = records[0].get("fields", {})
+        last = fields.get("Last_Baseline_Update_Date")
+        if not last:
+            return False
+        # Airtable may return a date string like 'YYYY-MM-DD' or full ISO with time
+        if isinstance(last, str):
+            date_str = last.split("T")[0]
+        else:
+            try:
+                date_str = last.date().isoformat()
+            except AttributeError:
+                return False
+        today_str = datetime.datetime.utcnow().date().isoformat()
+        return date_str == today_str
+    except Exception as e:
+        print(f"[Airtable] error checking baseline date: {e}", flush=True)
+        return False
+
 def get_last_positions_from_airtable():
     """Read last reported positions from Airtable. Returns dict: {serial: {'lat': float, 'lon': float}}"""
     table = get_airtable_table()
@@ -104,8 +131,14 @@ def update_airtable_positions(current_positions):
         return
     
     print("[Airtable] table connection OK", flush=True)
+
+    # Daily guard: only update baseline once per UTC day
+    if airtable_already_updated_today(table):
+        print("[Airtable] baseline already updated today; skipping update", flush=True)
+        return
     
     try:
+        today_str = datetime.datetime.utcnow().date().isoformat()
         # Validate and prepare positions
         validated_positions = {}
         for serial, pos in current_positions.items():
@@ -141,7 +174,8 @@ def update_airtable_positions(current_positions):
             fields = {
                 'Serial': str(serial),
                 'Last_Report_Lat': pos['lat'],
-                'Last_Report_Lon': pos['lon']
+                'Last_Report_Lon': pos['lon'],
+                'Last_Baseline_Update_Date': today_str
             }
             
             if serial in record_map:
