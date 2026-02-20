@@ -7,6 +7,10 @@ from flask import Flask, request, send_file, jsonify
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from pyairtable import Table
+import sys
+
+# Force stdout to flush immediately for Render logs
+sys.stdout.reconfigure(line_buffering=True)
 
 app = Flask(__name__)
 
@@ -71,21 +75,21 @@ def get_last_positions_from_airtable():
                     'lon': fields.get('Last_Report_Lon')
                 }
         
-        print(f"[Airtable] loaded {len(positions)} records")
+        print(f"[Airtable] loaded {len(positions)} records", flush=True)
         
         if positions:
             k = next(iter(positions))
-            print("[Airtable] sample:", k, positions[k])
+            print("[Airtable] sample:", k, positions[k], flush=True)
         
         bad = sum(
             1 for v in positions.values()
             if v.get("lat") in (None, "", "NULL") or v.get("lon") in (None, "", "NULL")
         )
-        print(f"[Airtable] missing lat/lon: {bad}/{len(positions)}")
+        print(f"[Airtable] missing lat/lon: {bad}/{len(positions)}", flush=True)
         
         return positions
     except Exception as e:
-        print(f"Error reading from Airtable: {e}")
+        print(f"Error reading from Airtable: {e}", flush=True)
         return {}
 
 def update_airtable_positions(current_positions):
@@ -93,13 +97,13 @@ def update_airtable_positions(current_positions):
     Update Airtable with current positions. Runs in background thread.
     Uses batch operations if available, otherwise individual operations with 429 retry.
     """
-    print(f"[Airtable] update requested for {len(current_positions)} trackers")
+    print(f"[Airtable] update requested for {len(current_positions)} trackers", flush=True)
     
     table = get_airtable_table()
     if not table:
         return
     
-    print("[Airtable] table connection OK")
+    print("[Airtable] table connection OK", flush=True)
     
     try:
         # Validate and prepare positions
@@ -110,11 +114,11 @@ def update_airtable_positions(current_positions):
                 lon = float(pos['lon'])
                 # Validate coordinate ranges
                 if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
-                    print(f"Skipping invalid coordinates for {serial}: lat={lat}, lon={lon}")
+                    print(f"Skipping invalid coordinates for {serial}: lat={lat}, lon={lon}", flush=True)
                     continue
                 validated_positions[serial] = {'lat': lat, 'lon': lon}
             except (ValueError, TypeError, KeyError) as e:
-                print(f"Skipping {serial} due to invalid position data: {e}")
+                print(f"Skipping {serial} due to invalid position data: {e}", flush=True)
                 continue
         
         if not validated_positions:
@@ -159,17 +163,17 @@ def update_airtable_positions(current_positions):
                     except Exception as e:
                         error_str = str(e)
                         if "429" in error_str or "Rate limit" in error_str:
-                            print(f"Rate limit hit during batch update, waiting 30 seconds...")
+                            print(f"Rate limit hit during batch update, waiting 30 seconds...", flush=True)
                             time.sleep(30)
                             table.batch_update(batch_data)
                         else:
-                            print(f"Error in batch update: {e}")
+                            print(f"Error in batch update: {e}", flush=True)
                             # Fall back to individual updates for this chunk
                             for record_id, fields in chunk:
                                 try:
                                     table.update(record_id, fields)
                                 except Exception as update_e:
-                                    print(f"Error updating record {record_id}: {update_e}")
+                                    print(f"Error updating record {record_id}: {update_e}", flush=True)
             else:
                 # Fall back to individual updates
                 for record_id, fields in updates_to_do:
@@ -178,14 +182,14 @@ def update_airtable_positions(current_positions):
                     except Exception as e:
                         error_str = str(e)
                         if "429" in error_str or "Rate limit" in error_str:
-                            print(f"Rate limit hit during update, waiting 30 seconds...")
+                            print(f"Rate limit hit during update, waiting 30 seconds...", flush=True)
                             time.sleep(30)
                             try:
                                 table.update(record_id, fields)
                             except Exception as retry_e:
-                                print(f"Error retrying update for record {record_id}: {retry_e}")
+                                print(f"Error retrying update for record {record_id}: {retry_e}", flush=True)
                         else:
-                            print(f"Error updating record {record_id}: {e}")
+                            print(f"Error updating record {record_id}: {e}", flush=True)
             
             # Try batch_create if available
             if hasattr(table, 'batch_create') and creates_to_do:
@@ -197,17 +201,17 @@ def update_airtable_positions(current_positions):
                     except Exception as e:
                         error_str = str(e)
                         if "429" in error_str or "Rate limit" in error_str:
-                            print(f"Rate limit hit during batch create, waiting 30 seconds...")
+                            print(f"Rate limit hit during batch create, waiting 30 seconds...", flush=True)
                             time.sleep(30)
                             table.batch_create(chunk)
                         else:
-                            print(f"Error in batch create: {e}")
+                            print(f"Error in batch create: {e}", flush=True)
                             # Fall back to individual creates
                             for fields in chunk:
                                 try:
                                     table.create(fields)
                                 except Exception as create_e:
-                                    print(f"Error creating record: {create_e}")
+                                    print(f"Error creating record: {create_e}", flush=True)
             else:
                 # Fall back to individual creates
                 for fields in creates_to_do:
@@ -216,14 +220,14 @@ def update_airtable_positions(current_positions):
                     except Exception as e:
                         error_str = str(e)
                         if "429" in error_str or "Rate limit" in error_str:
-                            print(f"Rate limit hit during create, waiting 30 seconds...")
+                            print(f"Rate limit hit during create, waiting 30 seconds...", flush=True)
                             time.sleep(30)
                             try:
                                 table.create(fields)
                             except Exception as retry_e:
-                                print(f"Error retrying create: {retry_e}")
+                                print(f"Error retrying create: {retry_e}", flush=True)
                         else:
-                            print(f"Error creating record: {e}")
+                            print(f"Error creating record: {e}", flush=True)
         except AttributeError:
             # pyairtable version doesn't support batch operations, use individual
             for record_id, fields in updates_to_do:
@@ -232,14 +236,14 @@ def update_airtable_positions(current_positions):
                 except Exception as e:
                     error_str = str(e)
                     if "429" in error_str or "Rate limit" in error_str:
-                        print(f"Rate limit hit during update, waiting 30 seconds...")
+                        print(f"Rate limit hit during update, waiting 30 seconds...", flush=True)
                         time.sleep(30)
                         try:
                             table.update(record_id, fields)
                         except Exception as retry_e:
-                            print(f"Error retrying update for record {record_id}: {retry_e}")
+                            print(f"Error retrying update for record {record_id}: {retry_e}", flush=True)
                     else:
-                        print(f"Error updating record {record_id}: {e}")
+                        print(f"Error updating record {record_id}: {e}", flush=True)
             
             for fields in creates_to_do:
                 try:
@@ -247,17 +251,17 @@ def update_airtable_positions(current_positions):
                 except Exception as e:
                     error_str = str(e)
                     if "429" in error_str or "Rate limit" in error_str:
-                        print(f"Rate limit hit during create, waiting 30 seconds...")
+                        print(f"Rate limit hit during create, waiting 30 seconds...", flush=True)
                         time.sleep(30)
                         try:
                             table.create(fields)
                         except Exception as retry_e:
-                            print(f"Error retrying create: {retry_e}")
+                            print(f"Error retrying create: {retry_e}", flush=True)
                     else:
-                        print(f"Error creating record: {e}")
+                        print(f"Error creating record: {e}", flush=True)
                     
     except Exception as e:
-        print(f"Error updating Airtable: {e}")
+        print(f"Error updating Airtable: {e}", flush=True)
 
 def calculate_duration(data):
     data['Timestamp'] = pd.to_datetime(data['Timestamp']).dt.tz_localize(None)
@@ -331,14 +335,14 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
     try:
         airtable_positions = get_last_positions_from_airtable()
     except Exception as e:
-        print(f"Error reading from Airtable, continuing without previous positions: {e}")
+        print(f"Error reading from Airtable, continuing without previous positions: {e}", flush=True)
         airtable_positions = {}
     
     # Confirm serial overlap
     air_serials = set(airtable_positions.keys())
     csv_serials = set(main_data["Serial"].dropna().tolist())
     overlap = air_serials.intersection(csv_serials)
-    print(f"[Debug] CSV serials: {len(csv_serials)} | Airtable serials: {len(air_serials)} | Overlap: {len(overlap)}")
+    print(f"[Debug] CSV serials: {len(csv_serials)} | Airtable serials: {len(air_serials)} | Overlap: {len(overlap)}", flush=True)
     
     # Calculate durations from location_data (still needs history for Time_At_Location)
     durations = {}
@@ -401,11 +405,11 @@ def process_dataframes(location_data: pd.DataFrame, main_data: pd.DataFrame, dat
             except (ValueError, TypeError):
                 continue
     
-    print(f"[CSV] current_positions collected: {len(current_positions)}")
+    print(f"[CSV] current_positions collected: {len(current_positions)}", flush=True)
     
     if len(current_positions) == 0:
         print("[CSV] sample raw Lat/Lon:",
-              main_data[["Serial","Lat","Lon"]].head(5).to_dict("records"))
+              main_data[["Serial","Lat","Lon"]].head(5).to_dict("records"), flush=True)
 
     # Remove temporary columns used for comparison
     main_data = main_data.drop(columns=['last_lat', 'last_lon'], errors='ignore')
@@ -449,11 +453,13 @@ def process():
       - Optional: date_for_name (string "YYYY_MM_DD") for the output filename.
     Returns: Excel file as an attachment (application/vnd.openxmlformats-officedocument.spreadsheetml.sheet)
     """
+    print("PROCESS ENDPOINT CALLED", flush=True)
     try:
         date_for_name = request.form.get("date_for_name")
 
         # Case 1: files uploaded directly
         if "location_csv" in request.files and "data_csv" in request.files:
+            print("Incoming request received", flush=True)
             location_data = pd.read_csv(request.files["location_csv"])
             main_data = pd.read_csv(request.files["data_csv"])
             fname, buf = process_dataframes(location_data, main_data, date_for_name)
@@ -467,6 +473,7 @@ def process():
             date_for_name = payload.get("date_for_name")
 
         if payload.get("location_url") and payload.get("data_url"):
+            print("Incoming request received", flush=True)
             # Note: Render blocks outbound to Google Drive preview URLs unless they're direct-download.
             # Prefer supplying direct file content via multipart where possible.
             import requests
